@@ -1,0 +1,2464 @@
+
+# Setup ----
+
+# Work
+setwd("C:/Users/jcast/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/1211_Micro Transit")
+
+# Home
+#setwd("C:/Users/Jeffrey Castanon/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/1211_Micro Transit")
+
+rm(list = ls())
+
+pkgTest <- function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE)
+    if (!require(x, character.only = TRUE)) stop("Package not found: ", x)
+  }
+}
+
+packages <- c(
+  "tidyverse",
+  "conflicted",
+  "lubridate",
+  "openxlsx"
+)
+
+invisible(lapply(packages, pkgTest))
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("lag", "dplyr")
+
+path_via <- "01_Source Data/cleaned_el_cajon_and_Southeast_SD_requests_Fixed_WAIT_and_RIDE_Times.csv"
+via_output_dir <- "04_Outputs"
+
+if (!dir.exists(via_output_dir)) {
+  dir.create(via_output_dir, recursive = TRUE)
+}
+
+via_output_workbook_path <- file.path(
+  via_output_dir,
+  paste0(
+    "via_microtransit_contract_cost_analysis_102026update",
+    format(Sys.Date(), "%m%d%Y"),
+    ".xlsx"
+  )
+)
+
+# Helpers ----
+
+col_or <- function(df, col_name, default) {
+  if (col_name %in% names(df)) {
+    df[[col_name]]
+  } else {
+    rep(default, nrow(df))
+  }
+}
+
+safe_num <- function(x) {
+  suppressWarnings(as.numeric(x))
+}
+
+parse_via_timestamp <- function(x) {
+  x <- stringr::str_trim(as.character(x))
+  x[x == ""] <- NA_character_
+  
+  suppressWarnings(
+    lubridate::parse_date_time(
+      x,
+      orders = c(
+        "Y-m-d H:M:S",
+        "Y-m-d H:M",
+        "Y/m/d H:M:S",
+        "Y/m/d H:M",
+        "m/d/Y H:M:S",
+        "m/d/Y H:M",
+        "m/d/Y I:M:S p",
+        "m/d/Y I:M p",
+        "Y-m-d",
+        "Y/m/d",
+        "m/d/Y"
+      ),
+      tz = "America/Los_Angeles",
+      quiet = TRUE
+    )
+  )
+}
+
+via_quantile_or_na <- function(x, p) {
+  x <- x[!is.na(x)]
+  
+  if (length(x) == 0) {
+    NA_real_
+  } else {
+    as.numeric(stats::quantile(x, p, type = 7))
+  }
+}
+
+via_min_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+}
+
+via_mean_or_na <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    mean(x, na.rm = TRUE)
+  }
+}
+
+via_median_or_na <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    median(x, na.rm = TRUE)
+  }
+}
+
+via_sum_or_na <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    sum(x, na.rm = TRUE)
+  }
+}
+
+via_max_or_na <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    max(x, na.rm = TRUE)
+  }
+}
+
+via_min_date_or_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) as.Date(NA) else min(x)
+}
+
+via_max_date_or_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) as.Date(NA) else max(x)
+}
+
+via_hour_label <- function(x) {
+  labels <- format(
+    as.POSIXct(
+      paste0("2000-01-01 ", sprintf("%02d", x), ":00:00"),
+      tz = "America/Los_Angeles"
+    ),
+    "%I %p"
+  )
+  
+  sub("^0", "", labels)
+}
+
+first_service_day <- function(month_start) {
+  month_end <- lubridate::ceiling_date(month_start, "month") - lubridate::days(1)
+  dates <- seq(month_start, month_end, by = "day")
+  min(dates[lubridate::wday(dates, week_start = 1) <= 5])
+}
+
+last_service_day <- function(month_start) {
+  month_end <- lubridate::ceiling_date(month_start, "month") - lubridate::days(1)
+  dates <- seq(month_start, month_end, by = "day")
+  max(dates[lubridate::wday(dates, week_start = 1) <= 5])
+}
+
+# Read and standardize request data ----
+
+
+via_raw <- readr::read_csv(
+  path_via,
+  show_col_types = FALSE
+)
+
+# Replace original Southeastern SD requests with updated data ----
+
+via_se_updated <- readr::read_csv(
+  "01_Source Data/cleaned_SE_San_Diego_requests.csv",
+  show_col_types = FALSE
+) %>%
+  dplyr::mutate(
+    Combined_ID = as.character(REQUEST_ID)
+  )
+
+via_raw <- dplyr::bind_rows(
+  via_raw %>%
+    dplyr::filter(
+      !stringr::str_to_lower(stringr::str_squish(LOCATION_NAME)) %in%
+        c("southeastern san diego", "southeast san diego", "southeastern sd")
+    ) %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), as.character)),
+  via_se_updated %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), as.character))
+)
+
+via_standardized <- via_raw %>%
+  dplyr::mutate(
+    location_name = stringr::str_to_lower(
+      stringr::str_squish(
+        as.character(
+          col_or(via_raw, "LOCATION_NAME", NA_character_)
+        )
+      )
+    ),
+    
+    system = dplyr::case_when(
+      location_name == "el cajon" ~ "El Cajon",
+      location_name %in% c(
+        "southeastern san diego",
+        "southeast san diego",
+        "southeastern sd"
+      ) ~ "Southeastern SD",
+      TRUE ~ NA_character_
+    ),
+    
+    request_timestamp = parse_via_timestamp(
+      col_or(via_raw, "REQUEST_TIMESTAMP", NA_character_)
+    ),
+    
+    dropoff_timestamp = parse_via_timestamp(
+      col_or(via_raw, "DROPOFF_TIMESTAMP", NA_character_)
+    ),
+    
+    ride_completed_timestamp = parse_via_timestamp(
+      col_or(via_raw, "RIDE_COMPLETED_TIMESTAMP", NA_character_)
+    ),
+    
+    completion_timestamp = dplyr::coalesce(
+      dropoff_timestamp,
+      ride_completed_timestamp
+    ),
+    
+    request_date = as.Date(
+      request_timestamp,
+      tz = "America/Los_Angeles"
+    ),
+    
+    completion_date = as.Date(
+      completion_timestamp,
+      tz = "America/Los_Angeles"
+    ),
+    
+    completion_hour = lubridate::hour(
+      completion_timestamp
+    ),
+    
+    request_status = as.character(
+      col_or(via_raw, "RIDE_STATUS", NA_character_)
+    ),
+    
+    completed = stringr::str_to_lower(
+      stringr::str_squish(request_status)
+    ) == "completed",
+    
+    passengers = safe_num(
+      col_or(via_raw, "RIDERSHIP_QTY", NA_real_)
+    ),
+    
+    trip_minutes = safe_num(
+      col_or(via_raw, "RIDE_TIME_CALCULATED", NA_real_)
+    ),
+    
+    wait_minutes = dplyr::coalesce(
+      safe_num(
+        col_or(via_raw, "WAIT_TIME_CALCULATED", NA_real_)
+      ),
+      safe_num(
+        col_or(via_raw, "WAIT_TIME_ETA_CALCULATED", NA_real_)
+      )
+    ),
+    
+    ride_distance_miles = dplyr::coalesce(
+      safe_num(
+        col_or(via_raw, "Ride_Distance", NA_real_)
+      ),
+      safe_num(
+        col_or(via_raw, "Ride Distance", NA_real_)
+      )
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(system),
+    !is.na(request_date)
+  )
+
+# Complete-month periods ----
+# A month is retained when the file covers the first and last scheduled
+# weekday of that month. Internal months are therefore retained even when
+# a service day has no requests. Daily zero-request service days are added
+# later from the service calendar.
+
+via_date_coverage <- via_standardized %>%
+  dplyr::group_by(system) %>%
+  dplyr::summarise(
+    first_request_date = min(request_date),
+    last_request_date = max(request_date),
+    .groups = "drop"
+  )
+
+via_complete_months <- via_date_coverage %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    candidate_month = list(
+      seq(
+        lubridate::floor_date(first_request_date, "month"),
+        lubridate::floor_date(last_request_date, "month"),
+        by = "month"
+      )
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  tidyr::unnest(candidate_month) %>%
+  dplyr::mutate(
+    first_scheduled_day = as.Date(
+      purrr::map_dbl(candidate_month, ~ as.numeric(first_service_day(.x))),
+      origin = "1970-01-01"
+    ),
+    last_scheduled_day = as.Date(
+      purrr::map_dbl(candidate_month, ~ as.numeric(last_service_day(.x))),
+      origin = "1970-01-01"
+    ),
+    complete_month =
+      first_request_date <= first_scheduled_day &
+      last_request_date >= last_scheduled_day
+  ) %>%
+  dplyr::filter(
+    complete_month |
+      (system == "Southeastern SD" &
+         candidate_month == lubridate::floor_date(last_request_date, "month"))
+  ) %>%
+  dplyr::filter(
+    (system == "El Cajon" &
+       candidate_month >= as.Date("2025-07-01") &
+       candidate_month <= as.Date("2026-06-01")) |
+      (system == "Southeastern SD" &
+         candidate_month >= as.Date("2026-01-01"))
+  ) %>%
+  dplyr::transmute(
+    system,
+    year_month = as.Date(candidate_month)
+  )
+
+if (nrow(via_complete_months) == 0) {
+  stop(
+    paste(
+      "No complete Via analysis months were identified.",
+      "Review REQUEST_TIMESTAMP parsing and LOCATION_NAME values."
+    )
+  )
+}
+
+via_request_data <- via_standardized %>%
+  dplyr::mutate(
+    year_month = lubridate::floor_date(request_date, "month")
+  ) %>%
+  dplyr::inner_join(
+    via_complete_months,
+    by = c("system", "year_month")
+  ) %>%
+  dplyr::select(
+    system,
+    year_month,
+    request_date,
+    request_timestamp,
+    completion_date,
+    completion_timestamp,
+    completion_hour,
+    request_status,
+    completed,
+    passengers,
+    trip_minutes,
+    wait_minutes,
+    ride_distance_miles
+  ) %>%
+  dplyr::arrange(
+    system,
+    request_date,
+    request_timestamp
+  )
+
+if (nrow(via_request_data) == 0) {
+  stop(
+    paste(
+      "Via request data is empty after complete-month filtering.",
+      "Review the complete-month table and parsed request dates."
+    )
+  )
+}
+
+# Service levels and contract cost ----
+
+year1_nte_cost <- 825614
+year1_total_vehicle_hours <- 6354
+via_cost_per_veh_hr_full <- year1_nte_cost / year1_total_vehicle_hours
+buffer_mins <- 5
+
+via_target_costs <- c(50, 25, 12.5, 7.5, 2.5)
+via_capacity_levels <- c(0.25, 0.50, 0.75, 1.00)
+
+via_service_levels_cost <- tibble::tibble(
+  system = c("El Cajon", "Southeastern SD"),
+  service_days = c("Monday-Friday", "Monday-Friday"),
+  service_hours = c("8:00 AM-5:00 PM", "7:00 AM-7:00 PM"),
+  service_start_hour = c(8L, 7L),
+  service_end_hour = c(17L, 19L),
+  vehicles = c(3, 4),
+  hours_per_day = c(9, 12)
+) %>%
+  dplyr::mutate(
+    veh_hours_per_day = vehicles * hours_per_day,
+    contract_cost_per_vehicle_hour = via_cost_per_veh_hr_full,
+    contract_daily_cost =
+      veh_hours_per_day * contract_cost_per_vehicle_hour
+  )
+
+via_contract_rates <- tibble::tibble(
+  contract_assumption = "Via Year 1 not-to-exceed contract",
+  year_1_not_to_exceed_cost = year1_nte_cost,
+  year_1_total_vehicle_hours = year1_total_vehicle_hours,
+  implied_contract_cost_per_vehicle_hour = via_cost_per_veh_hr_full
+)
+
+# Analysis service calendar ----
+
+via_analysis_calendar <- via_complete_months %>%
+  dplyr::mutate(
+    service_date = purrr::map(
+      year_month,
+      ~ seq(
+        .x,
+        lubridate::ceiling_date(.x, "month") - lubridate::days(1),
+        by = "day"
+      )
+    )
+  ) %>%
+  tidyr::unnest(service_date) %>%
+  dplyr::filter(
+    lubridate::wday(service_date, week_start = 1) <= 5
+  ) %>%
+  dplyr::arrange(
+    system,
+    service_date
+  )
+
+# Daily analysis ----
+
+via_daily_completed <- via_request_data %>%
+  dplyr::filter(completed) %>%
+  dplyr::group_by(
+    system,
+    request_date
+  ) %>%
+  dplyr::summarise(
+    completed_trips = dplyr::n(),
+    total_passengers = via_sum_or_na(passengers),
+    completed_trips_with_passenger_data = sum(!is.na(passengers)),
+    average_passengers_per_completed_trip = dplyr::if_else(
+      completed_trips_with_passenger_data > 0,
+      total_passengers / completed_trips_with_passenger_data,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+via_daily_all_requests <- via_request_data %>%
+  dplyr::group_by(
+    system,
+    request_date
+  ) %>%
+  dplyr::summarise(
+    total_requests = dplyr::n(),
+    .groups = "drop"
+  )
+
+via_daily_analysis <- via_analysis_calendar %>%
+  dplyr::rename(
+    request_date = service_date
+  ) %>%
+  dplyr::left_join(
+    via_daily_all_requests,
+    by = c("system", "request_date")
+  ) %>%
+  dplyr::left_join(
+    via_daily_completed,
+    by = c("system", "request_date")
+  ) %>%
+  dplyr::left_join(
+    via_service_levels_cost %>%
+      dplyr::select(
+        system,
+        vehicles,
+        hours_per_day,
+        veh_hours_per_day,
+        contract_cost_per_vehicle_hour,
+        contract_daily_cost
+      ),
+    by = "system"
+  ) %>%
+  dplyr::mutate(
+    average_passengers_per_completed_trip = dplyr::if_else(
+      !is.na(total_passengers) &
+        !is.na(completed_trips_with_passenger_data) &
+        completed_trips_with_passenger_data > 0,
+      total_passengers / completed_trips_with_passenger_data,
+      NA_real_
+    ),
+    cost_per_passenger = dplyr::if_else(
+      !is.na(total_passengers) & total_passengers > 0,
+      contract_daily_cost / total_passengers,
+      NA_real_
+    )
+  ) %>%
+  dplyr::select(
+    system,
+    year_month,
+    request_date,
+    total_requests,
+    completed_trips,
+    total_passengers,
+    average_passengers_per_completed_trip,
+    vehicles,
+    hours_per_day,
+    veh_hours_per_day,
+    contract_cost_per_vehicle_hour,
+    contract_daily_cost,
+    cost_per_passenger
+  ) %>%
+  dplyr::arrange(
+    system,
+    request_date
+  )
+
+# Ridership summary ----
+
+via_ridership_summary <- via_daily_analysis %>%
+  dplyr::group_by(system) %>%
+  dplyr::summarise(
+    first_observed_date = via_min_date_or_na(
+      request_date[!is.na(total_requests)]
+    ),
+    last_observed_date = via_max_date_or_na(
+      request_date[!is.na(total_requests)]
+    ),
+    service_days_in_calendar = dplyr::n(),
+    observed_service_days = sum(!is.na(total_requests)),
+    service_days_missing_data = sum(is.na(total_requests)),
+    min_daily_passengers = via_min_or_na(total_passengers),
+    mean_daily_passengers = via_mean_or_na(total_passengers),
+    p25_daily_passengers = via_quantile_or_na(total_passengers, 0.25),
+    median_daily_passengers = via_median_or_na(total_passengers),
+    p75_daily_passengers = via_quantile_or_na(total_passengers, 0.75),
+    p90_daily_passengers = via_quantile_or_na(total_passengers, 0.90),
+    max_daily_passengers = via_max_or_na(total_passengers),
+    total_passengers = via_sum_or_na(total_passengers),
+    .groups = "drop"
+  )
+
+# Monthly ridership ----
+
+# Monthly ridership ----
+
+via_monthly_ridership <- via_daily_analysis %>%
+  dplyr::group_by(
+    system,
+    year_month
+  ) %>%
+  dplyr::summarise(
+    service_days_in_calendar =
+      dplyr::n(),
+    
+    observed_service_days =
+      sum(!is.na(total_passengers)),
+    
+    service_days_missing_data =
+      sum(is.na(total_passengers)),
+    
+    monthly_total_requests =
+      sum(
+        total_requests,
+          na.rm = TRUE
+        ),
+    
+    monthly_completed_trips =
+      if (
+        all(is.na(completed_trips))
+      ) {
+        NA_real_
+      } else {
+        sum(
+          completed_trips,
+          na.rm = TRUE
+        )
+      },
+    
+    monthly_total_passengers =
+      if (
+        all(is.na(total_passengers))
+      ) {
+        NA_real_
+      } else {
+        sum(
+          total_passengers,
+          na.rm = TRUE
+        )
+      },
+    
+    mean_daily_passengers =
+      via_mean_or_na(
+        total_passengers
+      ),
+    
+    p25_daily_passengers =
+      via_quantile_or_na(
+        total_passengers,
+        0.25
+      ),
+    
+    median_daily_passengers =
+      via_median_or_na(
+        total_passengers
+      ),
+    
+    p75_daily_passengers =
+      via_quantile_or_na(
+        total_passengers,
+        0.75
+      ),
+    
+    p90_daily_passengers =
+      via_quantile_or_na(
+        total_passengers,
+        0.90
+      ),
+    
+    monthly_contract_cost =
+      if (
+        all(is.na(contract_daily_cost))
+      ) {
+        NA_real_
+      } else {
+        sum(
+          contract_daily_cost,
+          na.rm = TRUE
+        )
+      },
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    average_passengers_per_completed_trip =
+      dplyr::if_else(
+        !is.na(monthly_completed_trips) &
+          monthly_completed_trips > 0,
+        monthly_total_passengers /
+          monthly_completed_trips,
+        NA_real_
+      ),
+    
+    monthly_contract_cost_per_passenger =
+      dplyr::if_else(
+        !is.na(monthly_total_passengers) &
+          monthly_total_passengers > 0,
+        monthly_contract_cost /
+          monthly_total_passengers,
+        NA_real_
+      )
+  ) %>%
+  dplyr::rename(
+    total_requests =
+      monthly_total_requests,
+    
+    completed_trips =
+      monthly_completed_trips,
+    
+    total_passengers =
+      monthly_total_passengers
+  ) %>%
+  dplyr::select(
+    system,
+    year_month,
+    service_days_in_calendar,
+    observed_service_days,
+    service_days_missing_data,
+    total_requests,
+    completed_trips,
+    total_passengers,
+    mean_daily_passengers,
+    p25_daily_passengers,
+    median_daily_passengers,
+    p75_daily_passengers,
+    p90_daily_passengers,
+    average_passengers_per_completed_trip,
+    monthly_contract_cost,
+    monthly_contract_cost_per_passenger
+  ) %>%
+  dplyr::arrange(
+    system,
+    year_month
+  )
+
+write.csv(via_monthly_ridership, "via_monthly_ridership_102026update.csv")
+
+# Completion hour ----
+
+via_completion_hour_daily <- via_request_data %>%
+  dplyr::filter(
+    completed,
+    !is.na(completion_date),
+    !is.na(completion_hour)
+  ) %>%
+  dplyr::group_by(
+    system,
+    completion_date,
+    completion_hour
+  ) %>%
+  dplyr::summarise(
+    completed_passengers = via_sum_or_na(passengers),
+    completed_trips = dplyr::n(),
+    .groups = "drop"
+  )
+
+via_service_hour_calendar <- dplyr::bind_rows(
+  tibble::tibble(
+    system = "El Cajon",
+    completion_hour = 8:17
+  ),
+  tibble::tibble(
+    system = "Southeastern SD",
+    completion_hour = 7:19
+  )
+)
+
+via_completion_hour_calendar <- via_analysis_calendar %>%
+  dplyr::rename(
+    completion_date = service_date
+  ) %>%
+  dplyr::select(
+    system,
+    completion_date
+  ) %>%
+  dplyr::inner_join(
+    via_service_hour_calendar,
+    by = "system"
+  )
+
+via_completion_hour <- via_completion_hour_calendar %>%
+  dplyr::left_join(
+    via_completion_hour_daily,
+    by = c(
+      "system",
+      "completion_date",
+      "completion_hour"
+    )
+  ) %>%
+  dplyr::group_by(
+    system,
+    completion_hour
+  ) %>%
+  dplyr::summarise(
+    service_days_in_period = dplyr::n(),
+    service_days_with_data = sum(!is.na(completed_trips)),
+    service_days_missing_data = sum(is.na(completed_trips)),
+    service_days_with_completions = sum(
+      !is.na(completed_trips) & completed_trips > 0
+    ),
+    average_completed_passengers = via_mean_or_na(completed_passengers),
+    median_completed_passengers = via_median_or_na(completed_passengers),
+    total_completed_passengers = via_sum_or_na(completed_passengers),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    completion_hour_label = via_hour_label(completion_hour)
+  ) %>%
+  dplyr::arrange(
+    system,
+    completion_hour
+  )
+
+# Trip characteristics ----
+
+via_trip_characteristics <- via_request_data %>%
+  dplyr::filter(completed) %>%
+  dplyr::group_by(system) %>%
+  dplyr::summarise(
+    completed_trips = dplyr::n(),
+    completed_trips_with_passenger_data = sum(!is.na(passengers)),
+    completed_passengers = via_sum_or_na(passengers),
+    average_vehicle_occupancy = dplyr::if_else(
+      completed_trips_with_passenger_data > 0,
+      completed_passengers / completed_trips_with_passenger_data,
+      NA_real_
+    ),
+    average_trip_duration_minutes = via_mean_or_na(
+      trip_minutes[trip_minutes > 0 & trip_minutes < 180]
+    ),
+    median_trip_duration_minutes = via_median_or_na(
+      trip_minutes[trip_minutes > 0 & trip_minutes < 180]
+    ),
+    p75_trip_duration_minutes = via_quantile_or_na(
+      trip_minutes[trip_minutes > 0 & trip_minutes < 180],
+      0.75
+    ),
+    average_trip_distance_miles = via_mean_or_na(
+      ride_distance_miles[ride_distance_miles > 0]
+    ),
+    median_trip_distance_miles = via_median_or_na(
+      ride_distance_miles[ride_distance_miles > 0]
+    ),
+    average_wait_time_minutes = via_mean_or_na(
+      wait_minutes[wait_minutes >= 0 & wait_minutes < 180]
+    ),
+    median_wait_time_minutes = via_median_or_na(
+      wait_minutes[wait_minutes >= 0 & wait_minutes < 180]
+    ),
+    single_rider_booking_share = via_mean_or_na(
+      passengers == 1
+    ),
+    multiple_rider_booking_share = via_mean_or_na(
+      passengers > 1
+    ),
+    .groups = "drop"
+  )
+
+# Contract cost per passenger ----
+
+via_contract_cost_per_pax <- via_ridership_summary %>%
+  dplyr::left_join(
+    via_service_levels_cost %>%
+      dplyr::select(
+        system,
+        contract_cost_per_vehicle_hour,
+        veh_hours_per_day,
+        contract_daily_cost
+      ),
+    by = "system"
+  ) %>%
+  dplyr::mutate(
+    cost_at_median = dplyr::if_else(
+      median_daily_passengers > 0,
+      contract_daily_cost / median_daily_passengers,
+      NA_real_
+    ),
+    cost_at_p75 = dplyr::if_else(
+      p75_daily_passengers > 0,
+      contract_daily_cost / p75_daily_passengers,
+      NA_real_
+    ),
+    cost_at_p90 = dplyr::if_else(
+      p90_daily_passengers > 0,
+      contract_daily_cost / p90_daily_passengers,
+      NA_real_
+    ),
+    cost_at_max = dplyr::if_else(
+      max_daily_passengers > 0,
+      contract_daily_cost / max_daily_passengers,
+      NA_real_
+    )
+  ) %>%
+  dplyr::relocate(
+    contract_cost_per_vehicle_hour,
+    veh_hours_per_day,
+    contract_daily_cost,
+    .after = system
+  )
+
+# Target ridership ----
+
+via_target_ridership <- via_service_levels_cost %>%
+  dplyr::select(
+    system,
+    contract_cost_per_vehicle_hour,
+    veh_hours_per_day,
+    contract_daily_cost
+  ) %>%
+  tidyr::crossing(
+    target_cost_per_passenger = via_target_costs
+  ) %>%
+  dplyr::mutate(
+    passengers_per_day_needed =
+      contract_daily_cost / target_cost_per_passenger
+  ) %>%
+  dplyr::arrange(
+    system,
+    dplyr::desc(target_cost_per_passenger)
+  )
+
+# Capacity scenarios ----
+
+via_capacity_scenarios <- via_service_levels_cost %>%
+  dplyr::select(
+    system,
+    veh_hours_per_day,
+    contract_daily_cost
+  ) %>%
+  dplyr::left_join(
+    via_trip_characteristics %>%
+      dplyr::select(
+        system,
+        observed_average_vehicle_occupancy =
+          average_vehicle_occupancy,
+        p75_trip_duration_minutes
+      ),
+    by = "system"
+  ) %>%
+  dplyr::mutate(
+    planning_avo = 4,
+    
+    inter_trip_buffer_minutes =
+      buffer_mins,
+    
+    rough_daily_passenger_capacity =
+      (
+        veh_hours_per_day * 60 /
+          (
+            p75_trip_duration_minutes +
+              inter_trip_buffer_minutes
+          )
+      ) * planning_avo
+  ) %>%
+  tidyr::crossing(
+    utilization_level =
+      via_capacity_levels
+  ) %>%
+  dplyr::mutate(
+    passengers_at_utilization =
+      rough_daily_passenger_capacity *
+      utilization_level,
+    
+    cost_per_passenger =
+      dplyr::if_else(
+        passengers_at_utilization > 0,
+        contract_daily_cost /
+          passengers_at_utilization,
+        NA_real_
+      )
+  ) %>%
+  dplyr::arrange(
+    system,
+    utilization_level
+  )
+
+# Status summary ----
+
+via_status_summary <- via_request_data %>%
+  dplyr::count(
+    system,
+    request_status,
+    name = "requests"
+  ) %>%
+  dplyr::group_by(system) %>%
+  dplyr::mutate(
+    total_system_requests = sum(requests),
+    share_of_requests = requests / total_system_requests
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(
+    system,
+    dplyr::desc(requests)
+  )
+
+# QA ----
+
+via_qa <- tibble::tibble(
+  check = c(
+    "Standardized request rows",
+    "Complete analysis months",
+    "Daily analysis rows",
+    "Ridership summary rows",
+    "Trip-characteristic rows",
+    "Capacity-scenario rows"
+  ),
+  value = c(
+    nrow(via_request_data),
+    nrow(via_complete_months),
+    nrow(via_daily_analysis),
+    nrow(via_ridership_summary),
+    nrow(via_trip_characteristics),
+    nrow(via_capacity_scenarios)
+  )
+)
+
+if (nrow(via_ridership_summary) != 2) {
+  stop("Ridership Summary should contain one row for each Via pilot.")
+}
+
+if (
+  nrow(via_trip_characteristics) != 2 ||
+  any(is.na(via_trip_characteristics$average_vehicle_occupancy)) ||
+  any(is.na(via_trip_characteristics$p75_trip_duration_minutes))
+) {
+  stop(
+    paste(
+      "Capacity inputs are incomplete.",
+      "Review completed status, passenger counts, and ride-time fields."
+    )
+  )
+}
+
+# Workbook README ----
+
+via_readme <- tibble::tibble(
+  worksheet = c(
+    "README",
+    "QA",
+    "Request Data",
+    "Request Status",
+    "Daily Analysis",
+    "Service Levels Cost",
+    "Contract Rates",
+    "Ridership Summary",
+    "Monthly Ridership",
+    "Completion Hour",
+    "Trip Characteristics",
+    "Contract Cost Per Pax",
+    "Target Ridership",
+    "Capacity Scenarios"
+  ),
+  description = c(
+    "Worksheet inventory and analysis notes.",
+    "Basic row-count and completeness checks for the analysis outputs.",
+    "Standardized Via request-level data from complete analysis months.",
+    "Request-status counts and shares by Via pilot.",
+    paste(
+      "Daily requests, completed trips, passengers, scheduled vehicle-hours,",
+      "contract cost, and cost per passenger. Calendar service days without",
+      "observed request records remain NA and are not imputed as zero."
+    ),
+    "Contracted service assumptions and implied daily cost for each Via pilot.",
+    paste(
+      "Year 1 not-to-exceed contract amount, total vehicle-hours,",
+      "and implied contract cost per vehicle-hour."
+    ),
+    "Full-period distribution of daily completed passengers for each pilot.",
+    paste(
+      "Monthly ridership, daily ridership statistics, contract cost,",
+      "and contract cost per passenger."
+    ),
+    paste(
+      "Completed passengers by trip-completion hour. Service days and",
+      "scheduled hours without observed completion records remain NA."
+    ),
+    paste(
+      "Trip duration, distance, wait time, average vehicle occupancy,",
+      "and single- versus multiple-rider booking shares."
+    ),
+    paste(
+      "Contract cost per passenger at the median, 75th percentile,",
+      "90th percentile, and maximum observed daily ridership."
+    ),
+    paste(
+      "Passengers per day needed to reach selected",
+      "contract-cost-per-passenger targets."
+    ),
+    paste(
+      "Rough passenger capacity and contract cost per passenger",
+      "at selected utilization levels."
+    )
+  )
+)
+
+via_readme_notes <- tibble::tibble(
+  item = c(
+    "Workbook name",
+    "File created timestamp",
+    "Pilots included",
+    "Analysis grouping",
+    "Cost basis",
+    "Invoice analysis",
+    "Complete-month treatment",
+    "Zero-request service days",
+    "Capacity assumption"
+  ),
+  value = c(
+    basename(via_output_workbook_path),
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    "El Cajon and Southeastern San Diego",
+    paste(
+      "Each pilot is analyzed over its full available complete-month period.",
+      "Results are not split by fiscal year."
+    ),
+    paste(
+      "Contract cost is based on the Year 1 not-to-exceed amount",
+      "divided by contracted Year 1 vehicle-hours."
+    ),
+    "No invoice analysis is included because pilot invoice records were unavailable.",
+    paste(
+      "A month is retained when the source file covers its first and last",
+      "scheduled weekday."
+    ),
+    paste(
+      "The daily calendar includes every Monday-Friday in retained months.",
+      "Days with no request records are assigned zero requests and passengers."
+    ),
+    paste(
+      "Rough capacity uses scheduled daily vehicle-hours, the observed",
+      "75th-percentile completed-trip duration, a",
+      buffer_mins,
+      "minute inter-trip buffer, and observed average vehicle occupancy."
+    )
+  )
+)
+
+# Export workbook ----
+
+via_wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(
+  via_wb,
+  "README",
+  gridLines = TRUE
+)
+
+openxlsx::writeData(
+  via_wb,
+  "README",
+  via_readme,
+  withFilter = FALSE
+)
+
+openxlsx::writeData(
+  via_wb,
+  "README",
+  via_readme_notes,
+  startRow = nrow(via_readme) + 4,
+  withFilter = FALSE
+)
+
+via_sheets <- list(
+  "QA" = via_qa,
+  "Request Data" = via_request_data,
+  "Request Status" = via_status_summary,
+  "Daily Analysis" = via_daily_analysis,
+  "Service Levels Cost" = via_service_levels_cost,
+  "Contract Rates" = via_contract_rates,
+  "Ridership Summary" = via_ridership_summary,
+  "Monthly Ridership" = via_monthly_ridership,
+  "Completion Hour" = via_completion_hour,
+  "Trip Characteristics" = via_trip_characteristics,
+  "Contract Cost Per Pax" = via_contract_cost_per_pax,
+  "Target Ridership" = via_target_ridership,
+  "Capacity Scenarios" = via_capacity_scenarios
+)
+
+for (sheet_name in names(via_sheets)) {
+  openxlsx::addWorksheet(
+    via_wb,
+    sheet_name,
+    gridLines = TRUE
+  )
+  
+  openxlsx::writeData(
+    via_wb,
+    sheet_name,
+    via_sheets[[sheet_name]],
+    withFilter = FALSE
+  )
+}
+
+openxlsx::saveWorkbook(
+  via_wb,
+  via_output_workbook_path,
+  overwrite = TRUE
+)
+
+# QA prints ----
+
+print(via_date_coverage)
+print(via_complete_months)
+print(via_qa)
+print(via_service_levels_cost)
+print(via_ridership_summary)
+print(via_contract_cost_per_pax)
+print(via_target_ridership)
+print(via_trip_characteristics)
+print(via_capacity_scenarios)
+
+cat(
+  "Wrote Via contract-cost workbook to:",
+  via_output_workbook_path,
+  "\n"
+)
+
+
+
+via_raw %>%
+  dplyr::filter(
+    stringr::str_to_lower(stringr::str_squish(RIDE_STATUS)) == "completed"
+  ) %>%
+  dplyr::group_by(LOCATION_NAME) %>%
+  dplyr::summarise(
+    completed_trips = dplyr::n(),
+    pooled_trips = sum(IS_POOLING_TAG == 1, na.rm = TRUE),
+    pooling_share = mean(IS_POOLING_TAG == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+names(via_raw)
+
+# Via DOW, TOD, and reconstructed AVO analysis ----
+#
+# Required objects from the main Via script:
+#   via_raw
+#   via_complete_months
+#   via_daily_analysis
+#   via_service_levels_cost
+#   via_trip_characteristics
+#   via_output_dir
+#
+# Required helper functions:
+#   parse_via_timestamp()
+#   safe_num()
+#   via_mean_or_na()
+#   via_median_or_na()
+#   via_quantile_or_na()
+#   via_sum_or_na()
+#
+# Pooling definition:
+# A vehicle trip is classified as pooled only when:
+#   1. Two or more completed requests overlap on the same vehicle;
+#   2. The overlap lasts at least one minute; and
+#   3. Each overlapping request has IS_POOLING_TAG == 1.
+
+
+# Confirm that required objects exist ----
+
+via_required_objects <- c(
+  "via_raw",
+  "via_complete_months",
+  "via_daily_analysis",
+  "via_service_levels_cost",
+  "via_trip_characteristics",
+  "via_output_dir"
+)
+
+via_missing_objects <- via_required_objects[
+  !vapply(
+    via_required_objects,
+    exists,
+    logical(1),
+    inherits = TRUE
+  )
+]
+
+if (length(via_missing_objects) > 0) {
+  stop(
+    paste0(
+      "The following required objects do not exist: ",
+      paste(
+        via_missing_objects,
+        collapse = ", "
+      ),
+      ". Run the main Via analysis script before this add-on block."
+    )
+  )
+}
+
+
+# Standardize request fields needed for DOW, TOD, and pooling ----
+
+via_extended_requests <- via_raw %>%
+  dplyr::transmute(
+    location_name =
+      stringr::str_to_lower(
+        stringr::str_squish(
+          as.character(
+            LOCATION_NAME
+          )
+        )
+      ),
+    
+    system =
+      dplyr::case_when(
+        location_name == "el cajon" ~
+          "El Cajon",
+        
+        location_name %in% c(
+          "southeastern san diego",
+          "southeast san diego",
+          "southeastern sd"
+        ) ~
+          "Southeastern SD",
+        
+        TRUE ~
+          NA_character_
+      ),
+    
+    request_id =
+      as.character(
+        Combined_ID
+      ),
+    
+    vehicle_id =
+      as.character(
+        `Vehicle ID`
+      ),
+    
+    request_timestamp =
+      parse_via_timestamp(
+        REQUEST_TIMESTAMP
+      ),
+    
+    request_date =
+      as.Date(
+        request_timestamp,
+        tz = "America/Los_Angeles"
+      ),
+    
+    pickup_timestamp =
+      dplyr::coalesce(
+        parse_via_timestamp(
+          CALCULATED_PICKUP_TIMESTAMP
+        ),
+        parse_via_timestamp(
+          DRIVER_ARRIVED_TIMESTAMP
+        )
+      ),
+    
+    dropoff_timestamp =
+      parse_via_timestamp(
+        DROPOFF_TIMESTAMP
+      ),
+    
+    request_status =
+      stringr::str_to_lower(
+        stringr::str_squish(
+          as.character(
+            RIDE_STATUS
+          )
+        )
+      ),
+    
+    completed =
+      request_status == "completed",
+    
+    passengers =
+      safe_num(
+        RIDERSHIP_QTY
+      ),
+    
+    pooling_flag =
+      safe_num(
+        IS_POOLING_TAG
+      ) == 1
+  ) %>%
+  dplyr::filter(
+    !is.na(system),
+    !is.na(request_date)
+  ) %>%
+  dplyr::mutate(
+    year_month =
+      lubridate::floor_date(
+        request_date,
+        "month"
+      )
+  ) %>%
+  dplyr::inner_join(
+    via_complete_months,
+    by = c(
+      "system",
+      "year_month"
+    )
+  ) %>%
+  dplyr::arrange(
+    system,
+    request_date,
+    request_timestamp
+  )
+
+
+# Day-of-week analysis ----
+
+via_dow_daily <- via_daily_analysis %>%
+  dplyr::filter(
+    !is.na(total_passengers),
+    !is.na(veh_hours_per_day),
+    veh_hours_per_day > 0
+  ) %>%
+  dplyr::mutate(
+    day_of_week =
+      factor(
+        as.character(
+          lubridate::wday(
+            request_date,
+            label = TRUE,
+            abbr = FALSE,
+            week_start = 1
+          )
+        ),
+        levels = c(
+          "Monday",
+          "Tuesday",
+          "Wednesday",
+          "Thursday",
+          "Friday"
+        )
+      ),
+    
+    riders_per_vrh =
+      total_passengers /
+      veh_hours_per_day
+  ) %>%
+  dplyr::filter(
+    !is.na(day_of_week),
+    !is.na(riders_per_vrh),
+    is.finite(riders_per_vrh)
+  )
+
+
+via_dow_summary <- via_dow_daily %>%
+  dplyr::group_by(
+    system,
+    day_of_week
+  ) %>%
+  dplyr::summarise(
+    observed_service_days =
+      dplyr::n_distinct(
+        request_date
+      ),
+    
+    average_riders_per_vrh =
+      via_mean_or_na(
+        riders_per_vrh
+      ),
+    
+    minimum_riders_per_vrh =
+      min(
+        riders_per_vrh,
+        na.rm = TRUE
+      ),
+    
+    p25_riders_per_vrh =
+      via_quantile_or_na(
+        riders_per_vrh,
+        0.25
+      ),
+    
+    median_riders_per_vrh =
+      via_median_or_na(
+        riders_per_vrh
+      ),
+    
+    p75_riders_per_vrh =
+      via_quantile_or_na(
+        riders_per_vrh,
+        0.75
+      ),
+    
+    maximum_riders_per_vrh =
+      max(
+        riders_per_vrh,
+        na.rm = TRUE
+      ),
+    
+    total_completed_passengers =
+      via_sum_or_na(
+        total_passengers
+      ),
+    
+    total_scheduled_vrh =
+      sum(
+        veh_hours_per_day,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    system,
+    day_of_week
+  ) %>%
+  dplyr::mutate(
+    day_of_week =
+      as.character(
+        day_of_week
+      )
+  )
+
+
+# Time-of-day analysis ----
+#
+# Time categories match the Circuit analysis:
+#   Morning:   7:00 AM-9:59 AM
+#   Midday:   10:00 AM-2:59 PM
+#   Afternoon: 3:00 PM-6:59 PM
+#   Evening:   7:00 PM-11:59 PM
+#
+# El Cajon operates from 8:00 AM to 5:00 PM.
+# Southeastern SD operates from 7:00 AM to 7:00 PM.
+# Neither service therefore has scheduled Evening VRHs.
+
+via_time_periods <- tibble::tribble(
+  ~time_period, ~period_start_minute, ~period_end_minute,
+  "Morning",                    420,                600,
+  "Midday",                     600,                900,
+  "Afternoon",                  900,               1140,
+  "Evening",                   1140,               1440
+)
+
+
+# Calculate scheduled VRHs within each time period.
+
+via_tod_schedule <- via_service_levels_cost %>%
+  dplyr::select(
+    system,
+    vehicles,
+    service_start_hour,
+    service_end_hour
+  ) %>%
+  dplyr::mutate(
+    service_start_minute =
+      service_start_hour * 60,
+    
+    service_end_minute =
+      service_end_hour * 60
+  ) %>%
+  tidyr::crossing(
+    via_time_periods
+  ) %>%
+  dplyr::mutate(
+    overlap_minutes =
+      pmax(
+        0,
+        pmin(
+          service_end_minute,
+          period_end_minute
+        ) -
+          pmax(
+            service_start_minute,
+            period_start_minute
+          )
+      ),
+    
+    scheduled_hours_in_period =
+      overlap_minutes / 60,
+    
+    scheduled_vrh_in_period =
+      scheduled_hours_in_period *
+      vehicles
+  ) %>%
+  dplyr::filter(
+    scheduled_vrh_in_period > 0
+  ) %>%
+  dplyr::select(
+    system,
+    time_period,
+    scheduled_hours_in_period,
+    scheduled_vrh_in_period
+  )
+
+
+# Assign completed passengers to periods using pickup time.
+
+via_tod_completed <- via_extended_requests %>%
+  dplyr::filter(
+    completed,
+    !is.na(passengers),
+    passengers > 0,
+    !is.na(pickup_timestamp)
+  ) %>%
+  dplyr::mutate(
+    pickup_minute =
+      lubridate::hour(
+        pickup_timestamp
+      ) * 60 +
+      lubridate::minute(
+        pickup_timestamp
+      ),
+    
+    time_period =
+      dplyr::case_when(
+        pickup_minute >= 420 &
+          pickup_minute < 600 ~
+          "Morning",
+        
+        pickup_minute >= 600 &
+          pickup_minute < 900 ~
+          "Midday",
+        
+        pickup_minute >= 900 &
+          pickup_minute < 1140 ~
+          "Afternoon",
+        
+        pickup_minute >= 1140 &
+          pickup_minute < 1440 ~
+          "Evening",
+        
+        TRUE ~
+          NA_character_
+      )
+  ) %>%
+  dplyr::filter(
+    !is.na(time_period)
+  ) %>%
+  dplyr::group_by(
+    system,
+    request_date,
+    time_period
+  ) %>%
+  dplyr::summarise(
+    completed_requests =
+      dplyr::n(),
+    
+    completed_passengers =
+      sum(
+        passengers,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  )
+
+
+# Retain only service days with observed request data.
+
+via_observed_service_days <- via_daily_analysis %>%
+  dplyr::filter(
+    !is.na(total_requests)
+  ) %>%
+  dplyr::select(
+    system,
+    request_date
+  ) %>%
+  dplyr::distinct()
+
+
+# Create one row for every scheduled period on each observed service day.
+#
+# A scheduled period with no completed passengers is retained as a valid
+# zero-rider observation.
+
+via_tod_daily <- via_observed_service_days %>%
+  dplyr::inner_join(
+    via_tod_schedule,
+    by = "system",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::left_join(
+    via_tod_completed,
+    by = c(
+      "system",
+      "request_date",
+      "time_period"
+    )
+  ) %>%
+  dplyr::mutate(
+    completed_requests =
+      dplyr::coalesce(
+        completed_requests,
+        0L
+      ),
+    
+    completed_passengers =
+      dplyr::coalesce(
+        completed_passengers,
+        0
+      ),
+    
+    riders_per_vrh =
+      completed_passengers /
+      scheduled_vrh_in_period,
+    
+    time_period =
+      factor(
+        time_period,
+        levels = c(
+          "Morning",
+          "Midday",
+          "Afternoon",
+          "Evening"
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    !is.na(riders_per_vrh),
+    is.finite(riders_per_vrh)
+  ) %>%
+  dplyr::arrange(
+    system,
+    request_date,
+    time_period
+  )
+
+
+via_tod_summary <- via_tod_daily %>%
+  dplyr::group_by(
+    system,
+    time_period
+  ) %>%
+  dplyr::summarise(
+    observed_service_days =
+      dplyr::n_distinct(
+        request_date
+      ),
+    
+    average_riders_per_vrh =
+      via_mean_or_na(
+        riders_per_vrh
+      ),
+    
+    minimum_riders_per_vrh =
+      min(
+        riders_per_vrh,
+        na.rm = TRUE
+      ),
+    
+    p25_riders_per_vrh =
+      via_quantile_or_na(
+        riders_per_vrh,
+        0.25
+      ),
+    
+    median_riders_per_vrh =
+      via_median_or_na(
+        riders_per_vrh
+      ),
+    
+    p75_riders_per_vrh =
+      via_quantile_or_na(
+        riders_per_vrh,
+        0.75
+      ),
+    
+    maximum_riders_per_vrh =
+      max(
+        riders_per_vrh,
+        na.rm = TRUE
+      ),
+    
+    total_completed_passengers =
+      sum(
+        completed_passengers,
+        na.rm = TRUE
+      ),
+    
+    total_scheduled_vrh =
+      sum(
+        scheduled_vrh_in_period,
+        na.rm = TRUE
+      ),
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    system,
+    time_period
+  ) %>%
+  dplyr::mutate(
+    time_period =
+      as.character(
+        time_period
+      )
+  )
+
+
+# Reconstruct pooled vehicle trips ----
+
+via_pooling_intervals <- via_extended_requests %>%
+  dplyr::filter(
+    completed,
+    !is.na(request_id),
+    request_id != "",
+    !is.na(vehicle_id),
+    vehicle_id != "",
+    !is.na(pickup_timestamp),
+    !is.na(dropoff_timestamp),
+    dropoff_timestamp > pickup_timestamp,
+    !is.na(passengers),
+    passengers > 0
+  ) %>%
+  dplyr::mutate(
+    service_date =
+      as.Date(
+        pickup_timestamp,
+        tz = "America/Los_Angeles"
+      ),
+    
+    request_key =
+      dplyr::row_number(),
+    
+    pooling_flag =
+      dplyr::coalesce(
+        pooling_flag,
+        FALSE
+      )
+  ) %>%
+  dplyr::select(
+    system,
+    request_key,
+    request_id,
+    vehicle_id,
+    service_date,
+    pickup_timestamp,
+    dropoff_timestamp,
+    passengers,
+    pooling_flag
+  )
+
+
+# Identify qualifying overlapping request pairs.
+
+via_pooled_pairs <- via_pooling_intervals %>%
+  dplyr::inner_join(
+    via_pooling_intervals,
+    by = c(
+      "system",
+      "vehicle_id",
+      "service_date"
+    ),
+    suffix = c(
+      "_a",
+      "_b"
+    ),
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::filter(
+    request_key_a < request_key_b,
+    pooling_flag_a,
+    pooling_flag_b
+  ) %>%
+  dplyr::mutate(
+    overlap_start =
+      pmax(
+        pickup_timestamp_a,
+        pickup_timestamp_b
+      ),
+    
+    overlap_end =
+      pmin(
+        dropoff_timestamp_a,
+        dropoff_timestamp_b
+      ),
+    
+    overlap_minutes =
+      as.numeric(
+        difftime(
+          overlap_end,
+          overlap_start,
+          units = "mins"
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    overlap_minutes >= 1
+  )
+
+
+# Flag both requests in each qualifying pooled pair.
+
+via_pooled_request_keys <- dplyr::bind_rows(
+  via_pooled_pairs %>%
+    dplyr::transmute(
+      system,
+      request_key =
+        request_key_a
+    ),
+  
+  via_pooled_pairs %>%
+    dplyr::transmute(
+      system,
+      request_key =
+        request_key_b
+    )
+) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    reconstructed_pooled =
+      TRUE
+  )
+
+
+via_requests_with_pooling <- via_pooling_intervals %>%
+  dplyr::left_join(
+    via_pooled_request_keys,
+    by = c(
+      "system",
+      "request_key"
+    )
+  ) %>%
+  dplyr::mutate(
+    reconstructed_pooled =
+      dplyr::coalesce(
+        reconstructed_pooled,
+        FALSE
+      )
+  )
+
+
+# Group continuously overlapping requests on the same vehicle into
+# reconstructed vehicle trips.
+
+via_ride_events <- via_requests_with_pooling %>%
+  dplyr::arrange(
+    system,
+    vehicle_id,
+    service_date,
+    pickup_timestamp,
+    dropoff_timestamp
+  ) %>%
+  dplyr::group_by(
+    system,
+    vehicle_id,
+    service_date
+  ) %>%
+  dplyr::mutate(
+    dropoff_numeric =
+      as.numeric(
+        dropoff_timestamp
+      ),
+    
+    prior_latest_dropoff =
+      dplyr::lag(
+        cummax(
+          dropoff_numeric
+        )
+      ),
+    
+    new_ride_event =
+      dplyr::if_else(
+        is.na(
+          prior_latest_dropoff
+        ) |
+          as.numeric(
+            pickup_timestamp
+          ) >=
+          prior_latest_dropoff,
+        1L,
+        0L
+      ),
+    
+    ride_event_id =
+      cumsum(
+        new_ride_event
+      )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(
+    system,
+    vehicle_id,
+    service_date,
+    ride_event_id
+  ) %>%
+  dplyr::summarise(
+    completed_requests =
+      dplyr::n_distinct(
+        request_key
+      ),
+    
+    qualifying_pooled_requests =
+      sum(
+        reconstructed_pooled,
+        na.rm = TRUE
+      ),
+    
+    passengers_per_ride =
+      sum(
+        passengers,
+        na.rm = TRUE
+      ),
+    
+    ride_start =
+      min(
+        pickup_timestamp,
+        na.rm = TRUE
+      ),
+    
+    ride_end =
+      max(
+        dropoff_timestamp,
+        na.rm = TRUE
+      ),
+    
+    pooling_status =
+      dplyr::if_else(
+        completed_requests > 1 &
+          qualifying_pooled_requests ==
+          completed_requests,
+        "Pooled",
+        "Non-Pooled"
+      ),
+    
+    .groups = "drop"
+  )
+
+
+# Pooling QA ----
+
+via_pooled_ride_qa <- via_ride_events %>%
+  dplyr::filter(
+    pooling_status == "Pooled",
+    completed_requests < 2 |
+      passengers_per_ride < 2
+  )
+
+
+# AVO by pooling status ----
+
+via_avo_by_pooling <- via_ride_events %>%
+  dplyr::group_by(
+    system,
+    pooling_status
+  ) %>%
+  dplyr::summarise(
+    completed_rides =
+      dplyr::n(),
+    
+    completed_requests =
+      sum(
+        completed_requests,
+        na.rm = TRUE
+      ),
+    
+    completed_passengers =
+      sum(
+        passengers_per_ride,
+        na.rm = TRUE
+      ),
+    
+    aggregate_avo =
+      completed_passengers /
+      completed_rides,
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(
+    system
+  ) %>%
+  dplyr::mutate(
+    share_of_completed_rides =
+      completed_rides /
+      sum(
+        completed_rides
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+via_avo_all <- via_ride_events %>%
+  dplyr::group_by(
+    system
+  ) %>%
+  dplyr::summarise(
+    pooling_status =
+      "All Trips",
+    
+    completed_rides =
+      dplyr::n(),
+    
+    completed_requests =
+      sum(
+        completed_requests,
+        na.rm = TRUE
+      ),
+    
+    completed_passengers =
+      sum(
+        passengers_per_ride,
+        na.rm = TRUE
+      ),
+    
+    aggregate_avo =
+      completed_passengers /
+      completed_rides,
+    
+    share_of_completed_rides =
+      1,
+    
+    .groups = "drop"
+  )
+
+
+via_avo_results <- dplyr::bind_rows(
+  via_avo_by_pooling,
+  via_avo_all
+) %>%
+  dplyr::mutate(
+    pooling_status =
+      factor(
+        pooling_status,
+        levels = c(
+          "Non-Pooled",
+          "Pooled",
+          "All Trips"
+        )
+      )
+  ) %>%
+  dplyr::arrange(
+    system,
+    pooling_status
+  ) %>%
+  dplyr::mutate(
+    pooling_status =
+      as.character(
+        pooling_status
+      )
+  )
+
+
+# Replace request-level AVO with reconstructed vehicle-trip AVO ----
+
+via_trip_characteristics_revised <- via_trip_characteristics %>%
+  dplyr::select(
+    -average_vehicle_occupancy
+  ) %>%
+  dplyr::left_join(
+    via_avo_results %>%
+      dplyr::filter(
+        pooling_status ==
+          "All Trips"
+      ) %>%
+      dplyr::select(
+        system,
+        average_vehicle_occupancy =
+          aggregate_avo
+      ),
+    by = "system"
+  ) %>%
+  dplyr::left_join(
+    via_avo_results %>%
+      dplyr::filter(
+        pooling_status ==
+          "Pooled"
+      ) %>%
+      dplyr::select(
+        system,
+        reconstructed_pooling_share =
+          share_of_completed_rides
+      ),
+    by = "system"
+  ) %>%
+  dplyr::relocate(
+    average_vehicle_occupancy,
+    reconstructed_pooling_share,
+    .after = completed_passengers
+  )
+
+
+# Pooling-data coverage QA ----
+
+via_pooling_coverage_qa <- via_extended_requests %>%
+  dplyr::filter(
+    completed,
+    !is.na(passengers),
+    passengers > 0
+  ) %>%
+  dplyr::group_by(
+    system
+  ) %>%
+  dplyr::summarise(
+    completed_requests =
+      dplyr::n(),
+    
+    requests_with_vehicle_id =
+      sum(
+        !is.na(vehicle_id) &
+          vehicle_id != ""
+      ),
+    
+    requests_with_pickup =
+      sum(
+        !is.na(pickup_timestamp)
+      ),
+    
+    requests_with_dropoff =
+      sum(
+        !is.na(dropoff_timestamp)
+      ),
+    
+    requests_used_in_pooling_analysis =
+      sum(
+        !is.na(vehicle_id) &
+          vehicle_id != "" &
+          !is.na(pickup_timestamp) &
+          !is.na(dropoff_timestamp) &
+          dropoff_timestamp >
+          pickup_timestamp
+      ),
+    
+    share_used_in_pooling_analysis =
+      requests_used_in_pooling_analysis /
+      completed_requests,
+    
+    .groups = "drop"
+  )
+
+
+# Additional QA ----
+
+via_tod_schedule_qa <- via_tod_schedule %>%
+  dplyr::arrange(
+    system,
+    factor(
+      time_period,
+      levels = c(
+        "Morning",
+        "Midday",
+        "Afternoon",
+        "Evening"
+      )
+    )
+  )
+
+
+via_analysis_qa <- tibble::tibble(
+  check = c(
+    "DOW summary rows",
+    "TOD summary rows",
+    "AVO result rows",
+    "Revised trip-characteristic rows",
+    "Pooling coverage rows",
+    "Invalid pooled vehicle trips",
+    "Evening TOD rows"
+  ),
+  
+  value = c(
+    nrow(
+      via_dow_summary
+    ),
+    nrow(
+      via_tod_summary
+    ),
+    nrow(
+      via_avo_results
+    ),
+    nrow(
+      via_trip_characteristics_revised
+    ),
+    nrow(
+      via_pooling_coverage_qa
+    ),
+    nrow(
+      via_pooled_ride_qa
+    ),
+    sum(
+      via_tod_summary$time_period ==
+        "Evening",
+      na.rm = TRUE
+    )
+  )
+)
+
+
+# Stop if required outputs were not created correctly ----
+
+if (nrow(via_dow_summary) == 0) {
+  stop(
+    "The Via day-of-week summary is empty."
+  )
+}
+
+if (nrow(via_tod_summary) == 0) {
+  stop(
+    "The Via time-of-day summary is empty."
+  )
+}
+
+if (nrow(via_avo_results) == 0) {
+  stop(
+    "The Via AVO summary is empty."
+  )
+}
+
+if (nrow(via_trip_characteristics_revised) != 2) {
+  stop(
+    paste(
+      "The revised trip-characteristics output should contain",
+      "one row for each Via service."
+    )
+  )
+}
+
+if (nrow(via_pooled_ride_qa) > 0) {
+  warning(
+    paste(
+      "One or more pooled vehicle trips failed QA.",
+      "Review the Pooled Ride QA worksheet."
+    )
+  )
+}
+
+
+# Print results ----
+
+print(
+  via_dow_summary,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_tod_summary,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_avo_results,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_trip_characteristics_revised,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_pooling_coverage_qa,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_pooled_ride_qa,
+  n = Inf,
+  width = Inf
+)
+
+print(
+  via_analysis_qa,
+  n = Inf,
+  width = Inf
+)
+
+
+# Export complete Via DOW, TOD, and AVO workbook ----
+
+via_additional_output_path <- file.path(
+  via_output_dir,
+  paste0(
+    "via_dow_tod_avo_analysis_102026update",
+    format(
+      Sys.Date(),
+      "%m%d%Y"
+    ),
+    ".xlsx"
+  )
+)
+
+
+via_additional_outputs <- list(
+  "Day of Week" =
+    via_dow_summary,
+  
+  "Time of Day" =
+    via_tod_summary,
+  
+  "AVO by Pooling" =
+    via_avo_results,
+  
+  "Trip Characteristics" =
+    via_trip_characteristics_revised,
+  
+  "Pooling Coverage QA" =
+    via_pooling_coverage_qa,
+  
+  "Pooled Ride QA" =
+    via_pooled_ride_qa
+)
+
+
+# Confirm that every expected output exists and is a data frame.
+
+via_invalid_outputs <- names(
+  via_additional_outputs
+)[
+  !vapply(
+    via_additional_outputs,
+    function(x) {
+      is.data.frame(x)
+    },
+    logical(1)
+  )
+]
+
+if (length(via_invalid_outputs) > 0) {
+  stop(
+    paste0(
+      "The following workbook outputs are invalid: ",
+      paste(
+        via_invalid_outputs,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+via_additional_wb <- openxlsx::createWorkbook()
+
+
+for (
+  sheet_name in names(
+    via_additional_outputs
+  )
+) {
+  sheet_data <-
+    via_additional_outputs[[sheet_name]]
+  
+  openxlsx::addWorksheet(
+    via_additional_wb,
+    sheetName =
+      sheet_name,
+    gridLines =
+      TRUE
+  )
+  
+  openxlsx::writeData(
+    via_additional_wb,
+    sheet =
+      sheet_name,
+    x =
+      sheet_data,
+    withFilter =
+      FALSE
+  )
+  
+  openxlsx::freezePane(
+    via_additional_wb,
+    sheet =
+      sheet_name,
+    firstRow =
+      TRUE
+  )
+  
+  if (ncol(sheet_data) > 0) {
+    openxlsx::setColWidths(
+      via_additional_wb,
+      sheet =
+        sheet_name,
+      cols =
+        seq_len(
+          ncol(
+            sheet_data
+          )
+        ),
+      widths =
+        "auto"
+    )
+  }
+}
+
+
+openxlsx::saveWorkbook(
+  via_additional_wb,
+  via_additional_output_path,
+  overwrite =
+    TRUE
+)
+
+
+cat(
+  "\nWrote complete Via DOW, TOD, and AVO workbook to:\n",
+  via_additional_output_path,
+  "\n\nWorksheets:\n",
+  paste(
+    names(
+      via_additional_outputs
+    ),
+    collapse = "\n"
+  ),
+  "\n"
+)
